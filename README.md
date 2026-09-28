@@ -4,6 +4,8 @@
 `base`（共同祖先）、`current`（我方修订）、`incoming`（对方修订）——
 按 cue id 执行三方合并，检测字段级冲突、删除/修改冲突与时间轴重叠。
 `POST /resolve` 进一步支持对识别出的冲突提交人工决策，输出解决后的时间轴。
+`POST /retime` 则按一组 source/target 时间锚点，对 cue 的 start/end
+分段线性插值（含首尾区间外外推）完成整条时间轴的重校时。
 
 技术栈：Python 3.11 · FastAPI · Pydantic v2 · Uvicorn，全部依赖与启动初始化均在容器内完成。
 
@@ -222,6 +224,93 @@ curl -X POST http://localhost:8000/resolve \
 {"status":"resolved","cues":[{"id":"a","start":1.0,"end":9.0,"text":"keep","speaker":null}],"count":1}
 ```
 
+### POST /retime
+
+按 `source → target` 时间锚点对 cue 时间轴做分段线性校时。适用于整体帧率
+变化、片头插入/裁撤、播放速率分段变化等场景：给出至少两个已知的对应时间点，
+其余时间由锚点区间插值得到。
+
+请求体：
+
+| 字段      | 类型         | 说明                                   |
+| --------- | ------------ | -------------------------------------- |
+| `cues`    | Cue[]        | 待校时的 cue 列表（可空）              |
+| `anchors` | TimeAnchor[] | **至少 2 个**锚点，按 source 升序给出  |
+
+TimeAnchor 结构（时间单位为秒，支持小数，两列均须**非负且严格递增**）：
+
+```json
+{"source": 10.0, "target": 12.5}
+```
+
+`cues` 中每个元素沿用 Cue 结构（`id` 非空、`start/end` 非负且 `end > start`）。
+
+#### 映射规则
+
+1. 每条 cue 的 `start`、`end` **分别独立映射**：先按 cue 端点所在的锚点区间
+   `[source_k, source_{k+1}]` 线性插值，再用各自的 target 值；
+2. cue **跨越锚点**不受限制——start、end 可以落在不同区间（甚至锚点之外），
+   两端各算各的，不要求整条 cue 位于同一区间；
+3. 源时间**恰好等于**某个 source 锚点时，直接映射到对应 target；
+4. 早于首个锚点 / 晚于末个锚点时，沿**最近**的首/末区间斜率线性外推
+   （外推可能得到负时间，此时见下方 409）；
+5. `id`、`text`、`speaker` 原样保留，结果**保持输入顺序**（不按时间重排）。
+
+#### 响应
+
+- `200` 校时成功：
+
+```json
+{
+  "status": "retimed",
+  "cues": [ { "id": "a", "start": 100.0, "end": 120.0, "text": "hi", "speaker": null } ],
+  "count": 1
+}
+```
+
+- `409 status=retime_error`：任一 cue 映射后 `start`/`end` 为负，或映射后区间
+  非法（`end <= start`，极端退化斜率下可能发生）。响应按输入顺序列出**全部**
+  相关 cue id（同一 id 只列一次），**不输出任何部分结果**：
+
+```json
+{ "status": "retime_error", "cue_ids": ["a", "c"] }
+```
+
+- `422`：请求体校验失败——锚点少于 2 个、source/target 列非严格递增、
+  锚点时间为负，或输入 cue 本身非法（`end <= start` 等）。
+
+调用样例（锚点 0→100、10→120、20→160，三段斜率分别为 2、2、4）：
+
+```bash
+curl -X POST http://localhost:8000/retime \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "cues": [
+      {"id": "a", "start": 0,  "end": 10, "text": "你好", "speaker": "bob"},
+      {"id": "b", "start": 15, "end": 25, "text": "再见"}
+    ],
+    "anchors": [
+      {"source": 0,  "target": 100},
+      {"source": 10, "target": 120},
+      {"source": 20, "target": 160}
+    ]
+  }'
+```
+
+`a` 两端恰在锚点上映射为 100/120；`b` 的 start 在中间区间插值为 140、
+end 沿末区间外推为 180，顺序与文本/说话人不变：
+
+```json
+{
+  "status": "retimed",
+  "cues": [
+    {"id": "a", "start": 100.0, "end": 120.0, "text": "你好", "speaker": "bob"},
+    {"id": "b", "start": 140.0, "end": 180.0, "text": "再见", "speaker": null}
+  ],
+  "count": 2
+}
+```
+
 ## 快速试用
 
 ```bash
@@ -246,11 +335,12 @@ curl -X POST http://localhost:8000/merge \
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py       # FastAPI 路由（/health、/merge、/resolve、/）
+│   ├── main.py       # FastAPI 路由（/health、/merge、/resolve、/retime、/）
 │   ├── merge.py      # 三方合并、冲突决策应用与重叠检测纯逻辑
+│   ├── retime.py     # 锚点分段线性校时（插值/外推）纯逻辑
 │   └── models.py     # Pydantic 请求/响应模型
 ├── tests/
-│   └── test_api.py   # 46 个端到端用例（unittest + TestClient）
+│   └── test_api.py   # 64 个端到端用例（unittest + TestClient）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

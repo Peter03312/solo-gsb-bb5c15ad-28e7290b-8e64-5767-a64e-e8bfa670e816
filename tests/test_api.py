@@ -651,5 +651,202 @@ class ResolveTests(unittest.TestCase):
         self.assertEqual(ids, ["a", "b", "c", "d"])
 
 
+class RetimeTests(unittest.TestCase):
+    def anchors(self, *pairs):
+        return [{"source": s, "target": t} for s, t in pairs]
+
+    # —— 正常映射 ——
+
+    def test_linear_interpolation_within_single_segment(self):
+        body = {
+            "cues": [cue("a", 2, 4, "hello", "bob")],
+            "anchors": self.anchors((0, 0), (10, 20)),
+        }
+        resp = client.post("/retime", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["status"], "retimed")
+        self.assertEqual(data["count"], 1)
+        out = data["cues"][0]
+        self.assertAlmostEqual(out["start"], 4)
+        self.assertAlmostEqual(out["end"], 8)
+        self.assertEqual(out["id"], "a")
+        self.assertEqual(out["text"], "hello")
+        self.assertEqual(out["speaker"], "bob")
+
+    def test_anchor_source_maps_exactly_to_target(self):
+        # 斜率均为 20；端点恰好落在锚点上时映射到对应 target
+        body = {
+            "cues": [cue("a", 0, 5), cue("b", 5, 10), cue("c", 10, 12)],
+            "anchors": self.anchors((0, 100), (5, 200), (10, 300)),
+        }
+        resp = client.post("/retime", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        got = [(c["id"], c["start"], c["end"]) for c in resp.json()["cues"]]
+        self.assertEqual(got, [("a", 100, 200), ("b", 200, 300), ("c", 300, 340)])
+
+    def test_cue_spanning_multiple_anchors_ends_independent(self):
+        # 三段斜率依次为 1、2、3；cue 从第一段跨到第三段，两端各自计算
+        body = {
+            "cues": [cue("a", 5, 25)],
+            "anchors": self.anchors((0, 0), (10, 10), (20, 30), (30, 60)),
+        }
+        resp = client.post("/retime", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        out = resp.json()["cues"][0]
+        self.assertAlmostEqual(out["start"], 5)    # 第 1 段
+        self.assertAlmostEqual(out["end"], 45)     # 第 3 段：3*25-30
+
+    def test_extrapolation_after_last_anchor(self):
+        # 超出末锚点：沿末区间（斜率 2）外推
+        body = {
+            "cues": [cue("a", 15, 20)],
+            "anchors": self.anchors((0, 0), (10, 20)),
+        }
+        resp = client.post("/retime", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        out = resp.json()["cues"][0]
+        self.assertAlmostEqual(out["start"], 30)
+        self.assertAlmostEqual(out["end"], 40)
+
+    def test_extrapolation_before_first_anchor_positive(self):
+        # 早于首锚点：沿首区间外推，截距为正故结果仍非负
+        # slope = 0.2, intercept = 99；t=2 → 99.4，t=4 → 99.8
+        body = {
+            "cues": [cue("a", 2, 4)],
+            "anchors": self.anchors((5, 100), (10, 101)),
+        }
+        resp = client.post("/retime", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        out = resp.json()["cues"][0]
+        self.assertAlmostEqual(out["start"], 99.4)
+        self.assertAlmostEqual(out["end"], 99.8)
+
+    def test_preserves_input_order_without_sorting(self):
+        # 与 /merge 不同，/retime 不按时间重排
+        body = {
+            "cues": [cue("c", 30, 31), cue("b", 20, 21), cue("a", 10, 11)],
+            "anchors": self.anchors((0, 0), (100, 200)),
+        }
+        resp = client.post("/retime", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(
+            [c["id"] for c in resp.json()["cues"]], ["c", "b", "a"]
+        )
+
+    def test_missing_speaker_defaults_to_null(self):
+        body = {
+            "cues": [{"id": "a", "start": 2, "end": 4, "text": "hi"}],
+            "anchors": self.anchors((0, 0), (10, 10)),
+        }
+        resp = client.post("/retime", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertIsNone(resp.json()["cues"][0]["speaker"])
+
+    def test_empty_cue_list_ok(self):
+        body = {"cues": [], "anchors": self.anchors((0, 0), (10, 10))}
+        resp = client.post("/retime", json=body)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["status"], "retimed")
+        self.assertEqual(data["cues"], [])
+        self.assertEqual(data["count"], 0)
+
+    # —— 409：负时间 / 映射后区间非法，不输出部分结果 ——
+
+    def test_negative_mapped_time_returns_409(self):
+        # slope=2, intercept=-6：t=2 → -2
+        body = {
+            "cues": [cue("a", 2, 3)],
+            "anchors": self.anchors((5, 4), (10, 14)),
+        }
+        resp = client.post("/retime", json=body)
+        self.assertEqual(resp.status_code, 409)
+        data = resp.json()
+        self.assertEqual(data["status"], "retime_error")
+        self.assertEqual(data["cue_ids"], ["a"])
+        self.assertNotIn("cues", data)
+
+    def test_409_collects_all_bad_cues_in_input_order(self):
+        # b1、b2 外推到负时间；g 正常也不输出任何 cue
+        body = {
+            "cues": [
+                cue("g", 6, 7),
+                cue("b1", 1, 2),
+                cue("b2", 2, 6),
+            ],
+            "anchors": self.anchors((5, 4), (10, 14)),
+        }
+        resp = client.post("/retime", json=body)
+        self.assertEqual(resp.status_code, 409)
+        data = resp.json()
+        self.assertEqual(data["cue_ids"], ["b1", "b2"])
+        self.assertNotIn("cues", data)
+
+    def test_duplicate_bad_cue_id_listed_once(self):
+        # /retime 允许重复 id；同一 id 多条命中只列一次
+        body = {
+            "cues": [cue("a", 1, 2), cue("a", 2, 3)],
+            "anchors": self.anchors((5, 4), (10, 14)),
+        }
+        resp = client.post("/retime", json=body)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.json()["cue_ids"], ["a"])
+
+    def test_float_degenerate_interval_returns_409(self):
+        # 首区间外推截距很大（1e16 处浮点 ulp 为 2 秒）：
+        # 0.5 与 0.55 映射后舍入为同一浮点数，区间退化为 end <= start。
+        body = {
+            "cues": [cue("a", 0.5, 0.55)],
+            "anchors": self.anchors((1, 1e16), (2, 1e16 + 4)),
+        }
+        resp = client.post("/retime", json=body)
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.json()["cue_ids"], ["a"])
+
+    # —— 422：请求体 / 锚点不合法 ——
+
+    def test_less_than_two_anchors_rejected_422(self):
+        body = {"cues": [cue("a", 0, 1)], "anchors": self.anchors((0, 0))}
+        resp = client.post("/retime", json=body)
+        self.assertEqual(resp.status_code, 422)
+
+    def test_source_not_strictly_increasing_422(self):
+        body = {
+            "cues": [],
+            "anchors": self.anchors((0, 0), (5, 10), (5, 20)),
+        }
+        resp = client.post("/retime", json=body)
+        self.assertEqual(resp.status_code, 422)
+
+    def test_target_not_strictly_increasing_422(self):
+        body = {
+            "cues": [],
+            "anchors": self.anchors((0, 0), (5, 10), (10, 10)),
+        }
+        resp = client.post("/retime", json=body)
+        self.assertEqual(resp.status_code, 422)
+
+    def test_negative_anchor_rejected_422(self):
+        body = {
+            "cues": [],
+            "anchors": [{"source": -1, "target": 0}, {"source": 5, "target": 10}],
+        }
+        resp = client.post("/retime", json=body)
+        self.assertEqual(resp.status_code, 422)
+
+    def test_invalid_input_cue_interval_422(self):
+        body = {
+            "cues": [cue("a", 5, 2)],
+            "anchors": self.anchors((0, 0), (10, 10)),
+        }
+        resp = client.post("/retime", json=body)
+        self.assertEqual(resp.status_code, 422)
+
+    def test_missing_anchors_field_422(self):
+        resp = client.post("/retime", json={"cues": []})
+        self.assertEqual(resp.status_code, 422)
+
+
 if __name__ == "__main__":
     unittest.main()

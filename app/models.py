@@ -198,3 +198,52 @@ class HealthResponse(BaseModel):
     """健康检查响应。"""
 
     status: Literal["ok"] = "ok"
+
+
+class TimeAnchor(BaseModel):
+    """单个校时锚点：source 时间映射到 target 时间（秒）。"""
+
+    source: float = Field(..., ge=0, description="源时间轴锚点（秒，非负）")
+    target: float = Field(..., ge=0, description="目标时间轴锚点（秒，非负）")
+
+
+class RetimeRequest(BaseModel):
+    """POST /retime 的请求体：cues 与至少两个 source/target 时间锚点。"""
+
+    cues: list[Cue] = Field(default_factory=list, description="待校时的 cue 列表")
+    anchors: list[TimeAnchor] = Field(
+        ...,
+        min_length=2,
+        description="source→target 锚点（至少 2 个）；两列时间均须严格递增",
+    )
+
+    @model_validator(mode="after")
+    def _check_anchors_strictly_increasing(self) -> "RetimeRequest":
+        sources = [a.source for a in self.anchors]
+        targets = [a.target for a in self.anchors]
+        if any(b <= a for a, b in zip(sources, sources[1:])):
+            raise ValueError("anchors 的 source 时间必须严格递增")
+        if any(b <= a for a, b in zip(targets, targets[1:])):
+            raise ValueError("anchors 的 target 时间必须严格递增")
+        return self
+
+
+class RetimeErrorResponse(BaseModel):
+    """校时结果存在负时间或非法区间时的 409 响应：不输出部分结果。"""
+
+    status: Literal["retime_error"] = "retime_error"
+    cue_ids: list[str] = Field(
+        ...,
+        description=(
+            "映射后时间为负或区间非法（end <= start）的全部 cue id"
+            "（同一 cue 只列一次，按输入顺序）"
+        ),
+    )
+
+
+class RetimeSuccessResponse(BaseModel):
+    """校时成功：保持输入顺序，仅 start/end 被锚点映射改写。"""
+
+    status: Literal["retimed"] = "retimed"
+    cues: list[Cue]
+    count: int
